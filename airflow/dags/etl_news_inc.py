@@ -7,7 +7,7 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
-# from airflow.sensors.filesystem import FileSensor
+from airflow.sensors.filesystem import FileSensor
 from airflow.hooks.base_hook import BaseHook
 from airflow.utils.trigger_rule import TriggerRule
 from airflow import settings
@@ -117,15 +117,17 @@ def fn_load_data_file_to_db(data_file, store_connection_params, db_name, schema_
       row_date = datetime.strptime(el['published'], '%a, %d %b %Y %H:%M:%S %z').date().strftime('%Y-%m-%d')
     
       for tag in el['tags']:
-        new_el = {}
-        new_el['title'] = el.get('title', '')
-        new_el['link'] = el.get('link', '')
-        new_el['id'] = el.get('id', '')
-        new_el['summary'] = el.get('summary', '')
-        new_el['tags'] = tag.get('term', '')
-        new_el['source'] = table_name
-        new_el['published'] = row_date
-        data_to_df.append(new_el)
+        spl_tags = tag['term'].split(" / ")
+        for spl_tag in spl_tags:
+          new_el = {}
+          new_el['title'] = el.get('title', '')
+          new_el['link'] = el.get('link', '')
+          new_el['id'] = el.get('id', '')
+          new_el['summary'] = el.get('summary', '')
+          new_el['tags'] = spl_tag
+          new_el['source'] = table_name
+          new_el['published'] = row_date
+          data_to_df.append(new_el)
 
   if len(data_to_df) > 0:
 
@@ -192,8 +194,10 @@ etl_news_dag = DAG(
 )
 
 
+
 ## start
 task_start = DummyOperator(task_id='start', dag=etl_news_dag)
+
 
 
 # group_create_store
@@ -245,6 +249,7 @@ with TaskGroup(group_id='group_create_store', dag=etl_news_dag) as group_create_
   task_group_start >> task_create_mart_store >> task_group_end
 
 
+
 ## group_fs
 with TaskGroup(group_id='group_fs', dag=etl_news_dag) as group_fs:
 
@@ -263,6 +268,7 @@ with TaskGroup(group_id='group_fs', dag=etl_news_dag) as group_fs:
         )
 
     task_group_start >> task_create_folder >> task_group_end
+
 
 
 ## group_load
@@ -291,20 +297,6 @@ with TaskGroup(group_id='group_load', dag=etl_news_dag) as group_load:
     task_group_start >> task_load_data_to_folder >> task_group_end
 
 
-# task_branch = BranchSQLOperator(
-#     dag=etl_news_dag,
-#     task_id="task_branch",
-#     conn_id='connection_db',
-#     sql="select count(*) = 0 from raw_store.lenta_ru;", 
-#     follow_task_ids_if_true=['branch_true'],
-#     follow_task_ids_if_false=['branch_false']
-# )
-
-
-# branch_true = EmptyOperator(task_id="branch_true", dag=etl_news_dag)
-# branch_false = EmptyOperator(task_id="branch_false", dag=etl_news_dag)
-
-# # branch_true
 
 ## group_load_to_db
 with TaskGroup(group_id='group_load_to_db', dag=etl_news_dag) as group_load_to_db:
@@ -314,22 +306,30 @@ with TaskGroup(group_id='group_load_to_db', dag=etl_news_dag) as group_load_to_d
   task_group_end = EmptyOperator(task_id="group_load_end", dag=etl_news_dag)
 
   for folder in os.listdir(f"{raw_data_path}/{raw_data_folder_name}/initialization_data"):
-    for data_file in os.listdir(f"{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}"):
-      data_file = os.path.join(f"{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}", data_file)
+    for data_file_name in os.listdir(f"{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}"):
+      # data_file = os.path.join(f"{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}", data_file_name)
+
+      task_check_folder_include_data = FileSensor(
+        fs_conn_id='filepath',
+        task_id=f'wait_file_{folder}',
+        filepath=f'{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}/{data_file_name}',
+        dag=etl_news_dag
+      )
 
       task_load_data_file_to_db = PythonOperator(
         task_id=f'load_{folder}_from_initialization_data_to_db',
         python_callable=fn_load_data_file_to_db,
-        op_kwargs={'data_file': data_file,
+        op_kwargs={'data_file': os.path.join(f"{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}", data_file_name),
                   'store_connection_params': store_connection_params,
                   'db_name': db_name,
                   'schema_name': raw_store_name,
                   'table_name': folder
                   },
         dag=etl_news_dag
-    )
+      )
 
-      task_group_start >> task_load_data_file_to_db >> task_group_end
+      task_group_start >> task_check_folder_include_data >> task_load_data_file_to_db >> task_group_end
+
 
 
 ## group_create_core_store
@@ -409,7 +409,8 @@ with TaskGroup(group_id='group_create_mart_store', dag=etl_news_dag) as group_cr
         autocommit=True,
         database='postgres',
         sql="""
-          CREATE TABLE IF NOT EXISTS mart_store.news (
+          DROP TABLE IF EXISTS mart_store.news;
+          CREATE TABLE mart_store.news (
             id SERIAL PRIMARY KEY,
             category VARCHAR,
             source VARCHAR,
@@ -605,9 +606,5 @@ with TaskGroup(group_id='group_create_mart_store', dag=etl_news_dag) as group_cr
   )
 
   task_group_start >> get_raw_tables >> create_mart_store_news >> load_data_to_news_mart >> task_group_end
-
-
-# task_start >> group_create_store >> group_fs >> group_load >> task_branch >> branch_true
-# task_start >> group_create_store >> group_fs >> group_load >> task_branch >> branch_false >> group_load_to_db >> group_create_core_store >> group_create_mart_store
 
 task_start >> group_create_store >> group_fs >> group_load >>  group_load_to_db >> group_create_core_store >> group_create_mart_store
