@@ -63,7 +63,7 @@ except:
     conn = Connection(
         conn_id='filepath',
         conn_type='fs',
-        extra='{"path":"/opt/airflow/initialization_data"}'
+        extra='{"path":"/opt/airflow"}'
     )
     session = settings.Session()
     session.add(conn)
@@ -148,7 +148,7 @@ def fn_load_data_file_to_db(data_file, store_connection_params, db_name, schema_
     print(error)
 
   df = pd.DataFrame(data_to_df)
-  df.to_sql(f'news_df_{table_name}', schema=schema_name, con=engine, if_exists='replace', index=False)
+  df.to_sql(f'news_df_{table_name}', schema=schema_name, con=engine, if_exists='append', index=False)
 
 
 def def_get_raw_tables(store_name, store_connection_params, **kwargs):
@@ -176,22 +176,109 @@ def def_get_raw_tables(store_name, store_connection_params, **kwargs):
 
 def def_raw_tables_to_core(db_name, store_connection, **kwargs):
 
-     ti = kwargs['ti']
-     tables = ti.xcom_pull(key='raw_tables')
+  ti = kwargs['ti']
+  tables = ti.xcom_pull(key='raw_tables')
 
-     for news_table in tables:
+  store_cursor = store_connection.cursor()
+  for news_table in tables:
 
-      store_cursor = store_connection.cursor()
-      store_cursor.execute(f"""
-          INSERT INTO core_store.news (url, category, published, source)
+    store_cursor.execute(f"""
+          insert into core_store.sources (source_name)
             select
-                id,
-                tags,
-                published,
-                source
-            from raw_store.{news_table} ON CONFLICT DO NOTHING
-          """) 
-      store_connection.commit()
+              source 
+            from raw_store.{news_table}
+          ON CONFLICT DO NOTHING
+        """) 
+    store_connection.commit()
+
+    store_cursor.execute(f"""
+          insert into core_store.tags (tag_name)
+            select
+              tags 
+            from raw_store.{news_table}
+          ON CONFLICT DO nothing
+        """) 
+    store_connection.commit()
+
+    store_cursor.execute(f"""
+          insert into core_store.news_ids(new_raw_id)
+            select
+              id
+            from raw_store.{news_table}
+          ON CONFLICT DO nothing
+        """) 
+    store_connection.commit()
+
+    store_cursor.execute(f"""
+          insert into core_store.news_published_dates(new_id, new_published)
+            select
+              core_store.news_ids.new_id,
+              to_date(published, 'YYYY-MM-DD')
+            from raw_store.{news_table}
+          left join core_store.news_ids on core_store.news_ids.new_raw_id = raw_store.{news_table}.id
+          ON CONFLICT DO nothing
+        """) 
+    store_connection.commit()
+
+    store_cursor.execute(f"""
+          insert into core_store.news_summaries(new_id, summary)
+            select
+              core_store.news_ids.new_id,
+              summary
+            from raw_store.{news_table}
+          left join core_store.news_ids on core_store.news_ids.new_raw_id = raw_store.{news_table}.id
+          ON CONFLICT DO nothing
+        """) 
+    store_connection.commit()
+
+    store_cursor.execute(f"""
+          insert into core_store.news_links(new_id, link)
+            select
+              core_store.news_ids.new_id,
+              link
+            from raw_store.{news_table}
+          left join core_store.news_ids on core_store.news_ids.new_raw_id = raw_store.{news_table}.id
+          ON CONFLICT DO nothing
+        """) 
+    store_connection.commit()
+
+    store_cursor.execute(f"""
+          insert into core_store.news_titles(new_id, title)
+            select
+              core_store.news_ids.new_id,
+              title
+            from raw_store.{news_table}
+          left join core_store.news_ids on core_store.news_ids.new_raw_id = raw_store.{news_table}.id
+          ON CONFLICT DO nothing
+        """) 
+    store_connection.commit()
+
+    store_cursor.execute(f"""
+          insert into core_store.news_sources(new_id, source_id)
+            select
+              core_store.news_ids.new_id,
+              core_store.sources.source_id
+            from raw_store.{news_table}
+          left join core_store.sources on raw_store.{news_table}.source = core_store.sources.source_name
+          left join core_store.news_ids on core_store.news_ids.new_raw_id = raw_store.{news_table}.id
+          ON CONFLICT DO nothing
+        """) 
+    store_connection.commit()
+
+    store_cursor.execute(f"""
+          insert into core_store.news_tags(new_id, tag_id)
+            select
+              core_store.news_ids.new_id,
+              core_store.tags.tag_id 
+            from raw_store.{news_table}
+          left join core_store.tags  on raw_store.{news_table}.tags = core_store.tags.tag_name
+          left join core_store.news_ids on core_store.news_ids.new_raw_id = raw_store.{news_table}.id
+          ON CONFLICT DO nothing
+        """) 
+    store_connection.commit()
+
+  store_cursor.close()
+  store_connection.close()
 
 
 ############
@@ -270,7 +357,7 @@ with TaskGroup(group_id='group_fs', dag=etl_news_dag) as group_fs:
   for key in data_sources:
     task_create_folder = BashOperator(
             task_id=f'create_folder_{key}',
-            bash_command='mkdir -p {{ params.PATH }}/{{ params.RAW_FOLDER_NAME }}/initialization_data/{{ params.FOLDER }}',
+            bash_command='mkdir -p {{ params.PATH }}/{{ params.RAW_FOLDER_NAME }}/{{ params.FOLDER }}',
             params={'PATH': raw_data_path,
                     'RAW_FOLDER_NAME': raw_data_folder_name,
                     'FOLDER': key},
@@ -298,7 +385,7 @@ with TaskGroup(group_id='group_load', dag=etl_news_dag) as group_load:
         python_callable=fn_load_data_to_folder,
         op_kwargs={'url': data_sources[key],
                   'path': raw_data_path,
-                  'folder': f'{raw_data_folder_name}/initialization_data/{key}',
+                  'folder': f'{raw_data_folder_name}/{key}',
                   'file': f'{key}.xml'
                   },
         dag=etl_news_dag
@@ -315,21 +402,21 @@ with TaskGroup(group_id='group_load_to_db', dag=etl_news_dag) as group_load_to_d
 
   task_group_end = EmptyOperator(task_id="group_load_end", dag=etl_news_dag)
 
-  for folder in os.listdir(f"{raw_data_path}/{raw_data_folder_name}/initialization_data"):
-    for data_file_name in os.listdir(f"{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}"):
+  for folder in os.listdir(f"{raw_data_path}/{raw_data_folder_name}"):
+    for data_file_name in os.listdir(f"{raw_data_path}/{raw_data_folder_name}/{folder}"):
       # data_file = os.path.join(f"{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}", data_file_name)
 
       task_check_folder_include_data = FileSensor(
         fs_conn_id='filepath',
         task_id=f'wait_file_{folder}',
-        filepath=f'{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}/{data_file_name}',
+        filepath=f'{raw_data_path}/{raw_data_folder_name}/{folder}/{data_file_name}',
         dag=etl_news_dag
       )
 
       task_load_data_file_to_db = PythonOperator(
         task_id=f'load_{folder}_from_initialization_data_to_db',
         python_callable=fn_load_data_file_to_db,
-        op_kwargs={'data_file': os.path.join(f"{raw_data_path}/{raw_data_folder_name}/initialization_data/{folder}", data_file_name),
+        op_kwargs={'data_file': os.path.join(f"{raw_data_path}/{raw_data_folder_name}/{folder}", data_file_name),
                   'store_connection_params': store_connection_params,
                   'db_name': db_name,
                   'schema_name': raw_store_name,
@@ -368,13 +455,60 @@ with TaskGroup(group_id='group_create_core_store', dag=etl_news_dag) as group_cr
         autocommit=True,
         database='postgres',
         sql="""
-          CREATE TABLE IF NOT EXISTS core_store.news (
-            url varchar,
-            category varchar,
-            published varchar,
-            source varchar,
-            PRIMARY KEY (url, category)
-          )
+          create table if not exists core_store.sources (
+            source_id serial,
+            source_name varchar UNIQUE,
+            primary KEY(source_id)
+          );
+          create table if not exists core_store.tags (
+            tag_id serial,
+            tag_name varchar UNIQUE,
+            primary KEY(tag_id)
+          );
+          create table if not exists core_store.news_ids (
+            new_id serial,
+            new_raw_id varchar UNIQUE,
+            primary KEY(new_id)
+          );
+          create table if not exists core_store.news_published_dates (
+            new_id integer,
+            new_published date,
+            primary KEY(new_id),
+            FOREIGN KEY (new_id) REFERENCES core_store.news_ids ON DELETE SET null
+          );
+          create table if not exists core_store.news_summaries (
+            new_id integer,
+            summary varchar,
+            primary KEY(new_id),
+            FOREIGN KEY (new_id) REFERENCES core_store.news_ids ON DELETE SET null
+          );
+          create table if not exists core_store.news_links (
+            new_id integer,
+            link varchar,
+            primary KEY(new_id),
+            FOREIGN KEY (new_id) REFERENCES core_store.news_ids ON DELETE SET null
+          );
+          create table if not exists core_store.news_titles (
+            new_id integer,
+            title varchar,
+            primary KEY(new_id),
+            FOREIGN KEY (new_id) REFERENCES core_store.news_ids ON DELETE SET null
+          );
+          create table if not exists core_store.news_sources (
+            new_id integer,
+            source_id integer,
+            primary KEY(new_id),
+            FOREIGN KEY (new_id) REFERENCES core_store.news_ids ON DELETE SET null,
+            FOREIGN KEY (source_id) REFERENCES core_store.sources ON DELETE SET null
+          );
+          create table if not exists core_store.news_tags (
+            new_id integer,
+            tag_id integer,
+            primary KEY(new_id),
+            FOREIGN KEY (new_id) REFERENCES core_store.news_ids ON DELETE SET null,
+            FOREIGN KEY (tag_id) REFERENCES core_store.tags ON DELETE SET null
+          );
+
         """,
         dag=etl_news_dag
   )
@@ -448,17 +582,24 @@ with TaskGroup(group_id='group_create_mart_store', dag=etl_news_dag) as group_cr
       autocommit=True,
       database='postgres',
       sql="""
-        WITH temp1 AS (
-            select
-            category as category,
-            source as source,
-            count(url) over (partition by category) as all_source_count_category_news,
-            count(source) as source_count_category_news,
-            to_date(published, 'YYYY-MM-DD') as published,
-            count(url) over (partition by category, source, published) as max_news_per_day,
-            extract(dow from to_date(published, 'YYYY-MM-DD'))
-            from core_store.news n
-          group by category, source, n.url, published
+    WITH temp1 AS (
+			select
+	            core_store.news_tags.tag_id as category,
+	            core_store.news_sources.source_id as source,
+	            count(n.new_id) over (partition by core_store.news_tags.tag_id) as all_source_count_category_news,
+	            count(core_store.news_sources.source_id) as source_count_category_news,
+	            core_store.news_published_dates.new_published as published,
+	            count(n.new_id) over (partition by core_store.news_tags.tag_id, core_store.news_sources.source_id, core_store.news_published_dates.new_published) as max_news_per_day,
+	            extract(dow from core_store.news_published_dates.new_published)
+            from core_store.news_ids n
+	            left join core_store.news_tags on n.new_id = core_store.news_tags.new_id
+				left join core_store.news_sources on n.new_id = core_store.news_sources.new_id 
+				left join core_store.news_published_dates on n.new_id = core_store.news_published_dates.new_id 
+          group by 
+	          core_store.news_tags.tag_id, 
+	          core_store.news_sources.source_id, 
+	          n.new_id, 
+	          core_store.news_published_dates.new_published
         ),
         max_published as (
         select
@@ -580,8 +721,8 @@ with TaskGroup(group_id='group_create_mart_store', dag=etl_news_dag) as group_cr
           amount_news_sunday
         )
         select
-          category,
-          source,
+          core_store.tags.tag_name as category,
+          core_store.sources.source_name,
           all_source_count_category_news,
           source_count_category_news,
           all_source_count_category_news_today,
@@ -596,9 +737,11 @@ with TaskGroup(group_id='group_create_mart_store', dag=etl_news_dag) as group_cr
           amount_news_saturday,
           amount_news_sunday
         from mart
+        left join core_store.tags on core_store.tags.tag_id  = mart.category
+        left join core_store.sources on core_store.sources.source_id = mart.source
         group by
-          category,
-          source,
+          core_store.tags.tag_name,
+          core_store.sources.source_name,
           all_source_count_category_news,
           source_count_category_news,
           all_source_count_category_news_today,
@@ -611,7 +754,7 @@ with TaskGroup(group_id='group_create_mart_store', dag=etl_news_dag) as group_cr
           amount_news_friday,
           amount_news_saturday,
           amount_news_sunday
-              """,
+          """,
       dag=etl_news_dag
   )
 
